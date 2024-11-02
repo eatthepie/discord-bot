@@ -241,21 +241,30 @@ class HistoricalMonitor:
     def get_events(self, event_name: str, from_block: int, to_block: int) -> List[Dict[str, Any]]:
         try:
             event = getattr(self.contract.events, event_name)
-            event_filter = {
+            
+            # Get all logs for the specified block range
+            logs = self.w3.eth.get_logs({
                 'address': self.contract.address,
                 'fromBlock': from_block,
                 'toBlock': to_block
-            }
+            })
             
-            if hasattr(event, 'event_abi'):
-                event_signature_hex = self.w3.keccak(
-                    text=f"{event.event_abi['name']}({','.join([arg['type'] for arg in event.event_abi['inputs']])})"
-                ).hex()
-                event_filter['topics'] = [event_signature_hex]
-            
-            logs = self.w3.eth.get_logs(event_filter)
-            return [event.process_log(log) for log in logs]
-            
+            # Process logs
+            processed_events = []
+            for log in logs:
+                try:
+                    # Try to process each log
+                    processed_event = event().process_receipt({
+                        'logs': [log]
+                    })
+                    if processed_event:
+                        processed_events.extend(processed_event)
+                except Exception as e:
+                    # Skip logs that don't match this event
+                    continue
+                    
+            return processed_events
+                
         except Exception as e:
             logger.error(f"Error getting {event_name} events: {str(e)}")
             return []
