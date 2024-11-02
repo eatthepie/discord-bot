@@ -24,6 +24,10 @@ discord-bot/
 git clone https://github.com/eatthepie/discord-bot.git
 cd discord-bot
 
+# Permissions
+chmod +x monitor/setup-monitor.sh
+chmod +x bot/setup-bot.sh
+
 # Setup monitor
 sudo ./monitor/setup-monitor.sh
 

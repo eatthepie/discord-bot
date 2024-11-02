@@ -8,21 +8,30 @@ ENV_FILE="${INSTALL_DIR}/.env"
 echo "Setting up Discord Bot..."
 
 # Install dependencies
+echo "Installing system dependencies..."
 apt-get update
 apt-get install -y python3-pip python3-venv
 
 # Create installation directory if it doesn't exist
+echo "Creating installation directory..."
 mkdir -p ${INSTALL_DIR}
 
 # Copy bot files
+echo "Copying bot files..."
 cp bot/*.py ${INSTALL_DIR}/
 cp requirements.txt ${INSTALL_DIR}/
+cp .env ${INSTALL_DIR}/
 
 # Setup Python virtual environment
+echo "Setting up Python virtual environment..."
 cd ${INSTALL_DIR}
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+
+# Install Python dependencies with verbose output
+echo "Installing Python dependencies..."
+pip install -v pip --upgrade
+pip install -v -r requirements.txt
 
 # Setup environment file if it doesn't exist
 if [ ! -f ${ENV_FILE} ]; then
@@ -33,10 +42,12 @@ if [ ! -f ${ENV_FILE} ]; then
 fi
 
 # Install systemd service
+echo "Installing systemd service..."
 cp systemd/discord-bot.service /etc/systemd/system/
 systemctl daemon-reload
 
 # Set permissions
+echo "Setting permissions..."
 chown -R root:root ${INSTALL_DIR}
 chmod -R 755 ${INSTALL_DIR}
 chmod 600 ${ENV_FILE}

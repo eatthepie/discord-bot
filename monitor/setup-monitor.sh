@@ -17,6 +17,7 @@ mkdir -p ${INSTALL_DIR}
 # Copy monitor files
 cp monitor/*.py ${INSTALL_DIR}/
 cp requirements.txt ${INSTALL_DIR}/
+cp .env ${INSTALL_DIR}/
 
 # Setup Python virtual environment
 cd ${INSTALL_DIR}
