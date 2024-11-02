@@ -1,179 +1,181 @@
-# historical_monitor.py
+# run this with python historical-monitor.py --start-block [START_BLOCK] --end-block [END_BLOCK]
+
 import os
-from web3 import Web3
-import requests
 import time
+import argparse
 from datetime import datetime
-import json
-from eth_utils import to_checksum_address
 from dotenv import load_dotenv
+import logging
+from typing import List, Dict, Any, Optional, Tuple
+
+from web3 import Web3
+from eth_utils import to_checksum_address
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 from contract_abi import CONTRACT_ABI
 
-class HistoricalLotteryMonitor:
-    def __init__(self, start_block=None, end_block=None, chunk_size=1000):
-        load_dotenv()
-        
-        node_url = os.getenv('ETH_NODE_URL')
-        if not node_url:
-            raise ValueError("ETH_NODE_URL environment variable is not set")
-            
-        self.w3 = Web3(Web3.HTTPProvider(node_url))
-        
-        if not self.w3.is_connected():
-            raise ConnectionError(f"Failed to connect to Ethereum node at {node_url}")
-            
-        self.contract = self.w3.eth.contract(
-            address=to_checksum_address('0x043c9ae2764B5a7c2d685bc0262F8cF2f6D86008'),
-            abi=CONTRACT_ABI
-        )
-        
-        self.tickets_webhook = os.getenv('TICKETS_WEBHOOK_URL')
-        self.events_webhook = os.getenv('EVENTS_WEBHOOK_URL')
-        
-        if not self.tickets_webhook or not self.events_webhook:
-            raise ValueError("Webhook URLs are not properly set in environment variables")
-        
-        self.start_block = start_block or self.w3.eth.block_number - 1000
-        self.end_block = end_block or self.w3.eth.block_number
-        self.chunk_size = chunk_size
-        
-        print(f"Will scan blocks from {self.start_block} to {self.end_block} in chunks of {self.chunk_size}")
+# Load environment variables
+load_dotenv()
 
-    def process_chunk(self, start_block, end_block):
-        events_config = {
-            'TicketPurchased': (self.contract.events.TicketPurchased, self.handle_ticket_purchased, "Ticket Purchase"),
-            'DrawInitiated': (self.contract.events.DrawInitiated, self.handle_draw_initiated, "Draw Initiation"),
-            'RandomSet': (self.contract.events.RandomSet, self.handle_random_set, "Random Set"),
-            'VDFProofSubmitted': (self.contract.events.VDFProofSubmitted, self.handle_vdf_proof, "VDF Proof"),
-            'GamePrizePayoutInfo': (self.contract.events.GamePrizePayoutInfo, self.handle_prize_info, "Prize Info")
+# Constants
+CONTRACT_ADDRESS = '0x043c9ae2764B5a7c2d685bc0262F8cF2f6D86008'
+BATCH_SIZE = 1000  # Number of blocks to process in each batch
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class WebhookManager:
+    def __init__(self, tickets_webhook: str, events_webhook: str):
+        self.tickets_webhook = tickets_webhook
+        self.events_webhook = events_webhook
+        self.session = self._create_session()
+        
+        # Add counters for monitoring
+        self.webhook_counts = {
+            'tickets': 0,
+            'events': 0
         }
 
-        print(f"\nProcessing blocks {start_block} to {end_block}")
-        for event_name, (event_obj, handler, description) in events_config.items():
-            try:
-                events = event_obj.get_logs(fromBlock=start_block, toBlock=end_block)
-                if events:
-                    print(f"Found {len(events)} {event_name} events")
-                    for event in events:
-                        block_number = event['blockNumber']
-                        print(f"Processing {event_name} from block {block_number}")
-                        handler(event)
-                        # Add small delay to avoid Discord rate limits
-                        time.sleep(1)
-            except Exception as e:
-                print(f"Error processing {event_name} events in chunk: {e}")
+    def _create_session(self) -> requests.Session:
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504]
+        )
+        session = requests.Session()
+        session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
+        session.mount("http://", HTTPAdapter(max_retries=retry_strategy))
+        return session
 
-    def process_historical_events(self):
-        current_block = self.start_block
-        
-        while current_block < self.end_block:
-            chunk_end = min(current_block + self.chunk_size, self.end_block)
-            try:
-                self.process_chunk(current_block, chunk_end)
-            except Exception as e:
-                print(f"Error processing chunk {current_block} to {chunk_end}: {e}")
+    def send_webhook(self, webhook_url: str, embed: Dict[str, Any]) -> bool:
+        try:
+            payload = {"embeds": [embed]}
+            response = self.session.post(webhook_url, json=payload)
+            response.raise_for_status()
             
-            current_block = chunk_end + 1
-            # Add delay between chunks
-            time.sleep(2)
-    def format_eth(self, wei_amount):
+            # Update counters
+            if webhook_url == self.tickets_webhook:
+                self.webhook_counts['tickets'] += 1
+            else:
+                self.webhook_counts['events'] += 1
+                
+            logger.info(f"Successfully sent webhook: {embed.get('title', 'No title')}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send webhook: {str(e)}")
+            return False
+
+    def get_stats(self) -> Dict[str, int]:
+        return self.webhook_counts
+
+class EventHandler:
+    def __init__(self, w3: Web3, webhook_manager: WebhookManager):
+        self.w3 = w3
+        self.webhook_manager = webhook_manager
+        self.event_counts: Dict[str, int] = {
+            'TicketPurchased': 0,
+            'DrawInitiated': 0,
+            'RandomSet': 0,
+            'VDFProofSubmitted': 0,
+            'GamePrizePayoutInfo': 0
+        }
+
+    def get_etherscan_link(self, address: str) -> str:
+        return f"[{address[:6]}...{address[-4:]}](https://etherscan.io/address/{address})"
+
+    def format_eth(self, wei_amount: int) -> str:
         eth_amount = self.w3.from_wei(wei_amount, 'ether')
         return f"{eth_amount:.4f} ETH"
 
-    def get_etherscan_link(self, address):
-        return f"[{address[:6]}...{address[-4:]}](https://etherscan.io/address/{address})"
-
-    def send_webhook(self, webhook_url, embed):
-        """Send Discord webhook with retry logic"""
-        payload = {"embeds": [embed]}
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = requests.post(webhook_url, json=payload)
-                if response.status_code == 429:  # Rate limited
-                    retry_after = response.json().get('retry_after', 5)
-                    print(f"Rate limited, waiting {retry_after}ms")
-                    time.sleep(retry_after / 1000)
-                    continue
-                response.raise_for_status()
-                return True
-            except Exception as e:
-                print(f"Webhook error (attempt {attempt + 1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
-                continue
-        return False
-
-    # Event handlers remain the same as in the original monitor
-    def handle_ticket_purchased(self, event):
+    def handle_ticket_purchased(self, event: Dict[str, Any]) -> None:
+        self.event_counts['TicketPurchased'] += 1
         player = event['args']['player']
         numbers = event['args']['numbers']
         etherball = event['args']['etherball']
         game_number = event['args']['gameNumber']
+        tx_hash = event['transactionHash'].hex()
+        block_number = event['blockNumber']
+        tx_link = f"[View Transaction](https://etherscan.io/tx/{tx_hash})"
 
         embed = {
-            "title": "🎫 New Ticket Purchased!",
+            "title": f"🎟️ Historical Ticket Purchase (Block {block_number})",
             "color": 0x2ecc71,
             "fields": [
                 {"name": "Player", "value": self.get_etherscan_link(player), "inline": False},
+                {"name": "Transaction", "value": tx_link, "inline": False},
                 {"name": "Game Number", "value": str(game_number), "inline": True},
-                {"name": "Numbers", "value": f"{numbers[0]}-{numbers[1]}-{numbers[2]}", "inline": True},
-                {"name": "Etherball", "value": str(etherball), "inline": True},
-                {"name": "Block", "value": str(event['blockNumber']), "inline": True}
-            ],
-            "timestamp": datetime.utcnow().isoformat()
+                {"name": "Numbers", "value": f"{numbers[0]}-{numbers[1]}-{numbers[2]}-{etherball}", "inline": True}
+            ]
         }
-        
-        self.send_webhook(self.tickets_webhook, embed)
 
-    def handle_draw_initiated(self, event):
+        self.webhook_manager.send_webhook(self.webhook_manager.tickets_webhook, embed)
+
+    def handle_draw_initiated(self, event: Dict[str, Any]) -> None:
+        tx_hash = event['transactionHash'].hex()
+        tx_link = f"[View Transaction](https://etherscan.io/tx/{tx_hash})"
+
         embed = {
             "title": "🎲 Draw Initiated!",
             "color": 0x3498db,
             "fields": [
+                {"name": "Transaction", "value": tx_link, "inline": False},
                 {"name": "Game Number", "value": str(event['args']['gameNumber']), "inline": True},
-                {"name": "Target Block", "value": str(event['args']['targetSetBlock']), "inline": True},
-                {"name": "Block", "value": str(event['blockNumber']), "inline": True}
+                {"name": "Target Block", "value": str(event['args']['targetSetBlock']), "inline": True}
             ],
             "timestamp": datetime.utcnow().isoformat()
         }
         
-        self.send_webhook(self.events_webhook, embed)
+        self.webhook_manager.send_webhook(self.webhook_manager.events_webhook, embed)
 
-    def handle_random_set(self, event):
-        """Handle RandomSet events"""
+    def handle_random_set(self, event: Dict[str, Any]) -> None:
+        tx_hash = event['transactionHash'].hex()
+        tx_link = f"[View Transaction](https://etherscan.io/tx/{tx_hash})"
+
         embed = {
             "title": "🎲 RANDAO Value Set!",
-            "color": 0x9b59b6,  # Purple
+            "color": 0x9b59b6,
             "fields": [
+                {"name": "Transaction", "value": tx_link, "inline": False},
                 {"name": "Game Number", "value": str(event['args']['gameNumber']), "inline": True},
                 {"name": "Random Value", "value": hex(event['args']['random']), "inline": True}
             ],
             "timestamp": datetime.utcnow().isoformat()
         }
         
-        self.send_webhook(self.events_webhook, embed)
+        self.webhook_manager.send_webhook(self.webhook_manager.events_webhook, embed)
 
-    def handle_vdf_proof(self, event):
-        """Handle VDFProofSubmitted events"""
+    def handle_vdf_proof_submitted(self, event: Dict[str, Any]) -> None:
+        tx_hash = event['transactionHash'].hex()
+        tx_link = f"[View Transaction](https://etherscan.io/tx/{tx_hash})"
+
         embed = {
             "title": "🔐 VDF Proof Submitted!",
-            "color": 0xf1c40f,  # Gold
+            "color": 0xf1c40f,
             "fields": [
+                {"name": "Transaction", "value": tx_link, "inline": False},
                 {"name": "Submitter", "value": self.get_etherscan_link(event['args']['submitter']), "inline": True},
                 {"name": "Game Number", "value": str(event['args']['gameNumber']), "inline": True}
             ],
             "timestamp": datetime.utcnow().isoformat()
         }
         
-        self.send_webhook(self.events_webhook, embed)
+        self.webhook_manager.send_webhook(self.webhook_manager.events_webhook, embed)
 
-    def handle_prize_info(self, event):
-        """Handle GamePrizePayoutInfo events"""
+    def handle_game_prize_payout_info(self, event: Dict[str, Any]) -> None:
+        tx_hash = event['transactionHash'].hex()
+        tx_link = f"[View Transaction](https://etherscan.io/tx/{tx_hash})"
+
         embed = {
             "title": "💰 Prize Pool Announced!",
-            "color": 0xf1c40f,  # Gold
+            "color": 0xf1c40f,
             "fields": [
+                {"name": "Transaction", "value": tx_link, "inline": False},
                 {"name": "Game Number", "value": str(event['args']['gameNumber']), "inline": False},
                 {"name": "🥇 Gold Prize", "value": self.format_eth(event['args']['goldPrize']), "inline": True},
                 {"name": "🥈 Silver Prize", "value": self.format_eth(event['args']['silverPrize']), "inline": True},
@@ -182,61 +184,151 @@ class HistoricalLotteryMonitor:
             "timestamp": datetime.utcnow().isoformat()
         }
         
-        self.send_webhook(self.events_webhook, embed)
+        self.webhook_manager.send_webhook(self.webhook_manager.events_webhook, embed)
 
-    def process_events(self):
-        """Process all events from last checked block"""
+    def get_stats(self) -> Dict[str, int]:
+        return self.event_counts
+
+class HistoricalMonitor:
+    def __init__(self, start_block: int, end_block: int):
+        logger.info("Initializing HistoricalMonitor...")
+        
+        # Store block range
+        self.start_block = start_block
+        self.end_block = end_block
+        
+        # Load configuration
+        self.config = self._load_config()
+        
+        # Initialize components
+        self.w3 = self._initialize_web3()
+        self.contract = self._initialize_contract()
+        self.webhook_manager = WebhookManager(
+            self.config['tickets_webhook'],
+            self.config['events_webhook']
+        )
+        self.event_handler = EventHandler(self.w3, self.webhook_manager)
+        
+        # Initialize statistics
+        self.blocks_processed = 0
+        self.start_time = datetime.now()
+
+    def _load_config(self) -> Dict[str, str]:
+        config = {
+            'node_url': os.getenv('ETH_NODE_URL'),
+            'tickets_webhook': os.getenv('TICKETS_WEBHOOK_URL'),
+            'events_webhook': os.getenv('EVENTS_WEBHOOK_URL')
+        }
+        
+        if not all(config.values()):
+            raise ValueError("Missing required environment variables")
+            
+        return config
+
+    def _initialize_web3(self) -> Web3:
+        w3 = Web3(Web3.HTTPProvider(self.config['node_url']))
+        if not w3.is_connected():
+            raise ConnectionError("Failed to connect to Ethereum node")
+        logger.info("Successfully connected to Ethereum node")
+        return w3
+
+    def _initialize_contract(self) -> Any:
+        return self.w3.eth.contract(
+            address=to_checksum_address(CONTRACT_ADDRESS),
+            abi=CONTRACT_ABI
+        )
+
+    def get_events(self, event_name: str, from_block: int, to_block: int) -> List[Dict[str, Any]]:
         try:
-            current_block = self.w3.eth.block_number
-            if current_block > self.last_processed_block:
-                # Get events
-                events = {
-                    'TicketPurchased': self.contract.events.TicketPurchased.get_logs(fromBlock=self.last_processed_block + 1),
-                    'DrawInitiated': self.contract.events.DrawInitiated.get_logs(fromBlock=self.last_processed_block + 1),
-                    'RandomSet': self.contract.events.RandomSet.get_logs(fromBlock=self.last_processed_block + 1),
-                    'VDFProofSubmitted': self.contract.events.VDFProofSubmitted.get_logs(fromBlock=self.last_processed_block + 1),
-                    'GamePrizePayoutInfo': self.contract.events.GamePrizePayoutInfo.get_logs(fromBlock=self.last_processed_block + 1)
-                }
-
-                # Process events
-                handlers = {
-                    'TicketPurchased': self.handle_ticket_purchased,
-                    'DrawInitiated': self.handle_draw_initiated,
-                    'RandomSet': self.handle_random_set,
-                    'VDFProofSubmitted': self.handle_vdf_proof,
-                    'GamePrizePayoutInfo': self.handle_prize_info
-                }
-
-                for event_name, event_list in events.items():
-                    for event in event_list:
-                        handlers[event_name](event)
-
-                self.last_processed_block = current_block
-                
+            event = getattr(self.contract.events, event_name)
+            event_filter = {
+                'address': self.contract.address,
+                'fromBlock': from_block,
+                'toBlock': to_block
+            }
+            
+            if hasattr(event, 'event_abi'):
+                event_signature_hex = self.w3.keccak(
+                    text=f"{event.event_abi['name']}({','.join([arg['type'] for arg in event.event_abi['inputs']])})"
+                ).hex()
+                event_filter['topics'] = [event_signature_hex]
+            
+            logs = self.w3.eth.get_logs(event_filter)
+            return [event.process_log(log) for log in logs]
+            
         except Exception as e:
-            print(f"Error processing events: {e}")
+            logger.error(f"Error getting {event_name} events: {str(e)}")
+            return []
 
-    def run(self):
-        """Main loop"""
-        print(f"Starting monitoring from block {self.last_processed_block}")
-        while True:
-            self.process_events()
-            time.sleep(12)  # Average Ethereum block time
+    def print_progress(self, current_block: int) -> None:
+        self.blocks_processed = current_block - self.start_block + 1
+        progress = (self.blocks_processed / (self.end_block - self.start_block + 1)) * 100
+        elapsed_time = (datetime.now() - self.start_time).total_seconds()
+        blocks_per_second = self.blocks_processed / elapsed_time if elapsed_time > 0 else 0
+        
+        logger.info(
+            f"Progress: {progress:.2f}% | "
+            f"Blocks: {self.blocks_processed}/{self.end_block - self.start_block + 1} | "
+            f"Speed: {blocks_per_second:.2f} blocks/s"
+        )
+
+    def print_final_stats(self) -> None:
+        elapsed_time = (datetime.now() - self.start_time).total_seconds()
+        event_stats = self.event_handler.get_stats()
+        webhook_stats = self.webhook_manager.get_stats()
+        
+        logger.info("\n=== Final Statistics ===")
+        logger.info(f"Total blocks processed: {self.blocks_processed}")
+        logger.info(f"Total time: {elapsed_time:.2f} seconds")
+        logger.info(f"Average speed: {self.blocks_processed / elapsed_time:.2f} blocks/s")
+        logger.info("\nEvents found:")
+        for event_type, count in event_stats.items():
+            logger.info(f"  {event_type}: {count}")
+        logger.info("\nWebhooks sent:")
+        for webhook_type, count in webhook_stats.items():
+            logger.info(f"  {webhook_type}: {count}")
+
+    def process_events(self) -> None:
+        current_block = self.start_block
+        
+        while current_block <= self.end_block:
+            batch_end = min(current_block + BATCH_SIZE - 1, self.end_block)
+            logger.info(f"Processing blocks {current_block} to {batch_end}")
+
+            event_types = {
+                'TicketPurchased': 'ticket_purchased',
+                'DrawInitiated': 'draw_initiated',
+                'RandomSet': 'random_set',
+                'VDFProofSubmitted': 'vdf_proof_submitted',
+                'GamePrizePayoutInfo': 'game_prize_payout_info'
+            }
+
+            for event_type, handler_name in event_types.items():
+                events = self.get_events(event_type, current_block, batch_end)
+                if events:
+                    logger.info(f"Found {len(events)} {event_type} events")
+                    handler = getattr(self.event_handler, f"handle_{handler_name}")
+                    for event in events:
+                        handler(event)
+
+            self.print_progress(batch_end)
+            current_block = batch_end + 1
+            time.sleep(1)  # Rate limiting
+
+        self.print_final_stats()
+
+def main():
+    parser = argparse.ArgumentParser(description='Process historical lottery events')
+    parser.add_argument('--start-block', type=int, required=True, help='Starting block number')
+    parser.add_argument('--end-block', type=int, required=True, help='Ending block number')
+    args = parser.parse_args()
+
+    try:
+        monitor = HistoricalMonitor(args.start_block, args.end_block)
+        monitor.process_events()
+    except Exception as e:
+        logger.error(f"Failed to process historical events: {str(e)}", exc_info=True)
+        raise
 
 if __name__ == "__main__":
-    # Example: Process events from the last 1000 blocks
-    # latest_block = Web3(Web3.HTTPProvider(os.getenv('ETH_NODE_URL'))).eth.block_number
-    # start_block = latest_block - 1000
-
-    # monitor = HistoricalLotteryMonitor(start_block=start_block, end_block=latest_block)
-    # monitor.process_historical_events()
-
-    # print(f"Processing events from block {start_block} to {latest_block}")
-
-    # Example: Process specific range in chunks
-    monitor = HistoricalLotteryMonitor(
-        start_block=21072190,
-        end_block=21079930,
-        chunk_size=100  # Adjust this if still too large
-    )
-    monitor.process_historical_events()
+    main()
