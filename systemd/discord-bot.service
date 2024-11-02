@@ -1,0 +1,17 @@
+# discord-bot.service
+[Unit]
+Description=Discord Status Bot
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=1
+User=root
+WorkingDirectory=/opt/discord-bot
+EnvironmentFile=/opt/discord-bot/.env
+ExecStart=/opt/discord-bot/venv/bin/python status_bot.py
+
+[Install]
+WantedBy=multi-user.target

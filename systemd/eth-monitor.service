@@ -1,0 +1,17 @@
+# eth-monitor.service
+[Unit]
+Description=Ethereum Lottery Monitor
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=1
+User=root
+WorkingDirectory=/opt/eth-monitor
+EnvironmentFile=/opt/eth-monitor/.env
+ExecStart=/opt/eth-monitor/venv/bin/python monitor.py
+
+[Install]
+WantedBy=multi-user.target
