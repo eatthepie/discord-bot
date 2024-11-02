@@ -5,6 +5,7 @@ from web3 import Web3
 from discord.ext import tasks
 from dotenv import load_dotenv
 import logging
+from functools import partial
 
 # Configure logging
 logging.basicConfig(
@@ -52,22 +53,19 @@ CONTRACT_ABI = [
 contract = w3.eth.contract(address=CONTRACT_ADDRESS, abi=CONTRACT_ABI)
 
 class StatusBot(discord.Client):
-    def __init__(self, update_func, bot_type, token, *args, **kwargs):
+    def __init__(self, update_func, bot_type, *args, **kwargs):
         intents = discord.Intents.default()
         super().__init__(intents=intents, *args, **kwargs)
         self.update_func = update_func
         self.bot_type = bot_type
-        self.token = token
         self.last_value = None
-
-    async def setup_hook(self):
         self.status_update.start()
-        logger.info(f"{self.bot_type} Bot: Setup completed")
 
     @tasks.loop(seconds=UPDATE_INTERVAL)
     async def status_update(self):
         try:
             new_value = await self.update_func()
+            
             if new_value != self.last_value:
                 self.last_value = new_value
                 for guild in self.guilds:
@@ -86,10 +84,17 @@ class StatusBot(discord.Client):
         await self.wait_until_ready()
         logger.info(f"{self.bot_type} Bot: Ready!")
 
+    async def setup_hook(self):
+        logger.info(f"{self.bot_type} Bot: Setup completed")
+
+async def run_in_executor(func, *args):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, func, *args)
+
 async def get_game_number():
     """Query current game number from smart contract"""
     try:
-        game_number = await asyncio.to_thread(
+        game_number = await run_in_executor(
             contract.functions.currentGameNumber().call
         )
         return f"Game #{game_number}"
@@ -100,12 +105,14 @@ async def get_game_number():
 async def get_prize_pool():
     """Query current prize pool from smart contract"""
     try:
-        current_game = await asyncio.to_thread(
+        current_game = await run_in_executor(
             contract.functions.currentGameNumber().call
         )
-        prize_pool_wei = await asyncio.to_thread(
+        
+        prize_pool_wei = await run_in_executor(
             contract.functions.gamePrizePool(current_game).call
         )
+        
         prize_pool_eth = w3.from_wei(prize_pool_wei, 'ether')
         return f"Prize: {prize_pool_eth:.2f} ETH"
     except Exception as e:
@@ -113,28 +120,38 @@ async def get_prize_pool():
         return "Prize: Error"
 
 async def main():
+    # Create bot instances with their respective update functions
+    game_bot = StatusBot(
+        update_func=get_game_number,
+        bot_type="Game",
+        intents=discord.Intents.default()
+    )
+    
+    prize_bot = StatusBot(
+        update_func=get_prize_pool,
+        bot_type="Prize",
+        intents=discord.Intents.default()
+    )
+
     try:
-        # Create bot instances
-        game_bot = StatusBot(
-            update_func=get_game_number,
-            bot_type="Game",
-            token=GAME_BOT_TOKEN
+        # Run both bots concurrently
+        await asyncio.gather(
+            game_bot.start(GAME_BOT_TOKEN),
+            prize_bot.start(PRIZE_BOT_TOKEN)
         )
-        
-        prize_bot = StatusBot(
-            update_func=get_prize_pool,
-            bot_type="Prize",
-            token=PRIZE_BOT_TOKEN
-        )
-
-        # Run both bots
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(game_bot.start(game_bot.token))
-            tg.create_task(prize_bot.start(prize_bot.token))
-
     except Exception as e:
         logger.error(f"Error running bots: {str(e)}")
-        raise
+    finally:
+        # Cleanup
+        if not game_bot.is_closed():
+            await game_bot.close()
+        if not prize_bot.is_closed():
+            await prize_bot.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Received shutdown signal, closing bots...")
+    except Exception as e:
+        logger.error(f"Fatal error: {str(e)}")
