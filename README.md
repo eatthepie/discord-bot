@@ -34,10 +34,6 @@ sudo ./monitor/setup-monitor.sh
 # Setup bot
 sudo ./bot/setup-bot.sh
 
-# Configure environment variables
-sudo nano /opt/eth-monitor/.env
-sudo nano /opt/discord-bot/.env
-
 # Start services
 sudo systemctl start eth-monitor discord-bot
 ```
