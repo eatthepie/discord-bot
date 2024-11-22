@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
-# Configuration
+# Configuration variables remain the same
 ETH_NODE_URL = os.getenv('ETH_NODE_URL')
 ETH_CONTRACT_ADDRESS = os.getenv('ETH_CONTRACT_ADDRESS')
 ETH_GAME_BOT_TOKEN = os.getenv('ETH_GAME_BOT_TOKEN')
@@ -45,7 +45,7 @@ for token_name, token in required_tokens.items():
 eth_w3 = Web3(Web3.HTTPProvider(ETH_NODE_URL))
 world_w3 = Web3(Web3.HTTPProvider(WORLD_NODE_URL))
 
-# Contract ABI (same for both networks)
+# Contract ABI remains the same
 CONTRACT_ABI = [
     {
         "inputs": [],
@@ -70,10 +70,11 @@ world_contract = world_w3.eth.contract(address=WORLD_CONTRACT_ADDRESS, abi=CONTR
 class StatusBot(discord.Client):
     def __init__(self, update_func, bot_type, network):
         intents = discord.Intents.default()
-        super().__init__(intents=intents)
+        super().__init__(intents=intents, activity=discord.Game(name="Initializing..."))
         self.update_func = update_func
         self.bot_type = bot_type
         self.network = network
+        self.last_title = None
         self.last_value = None
 
     async def setup_hook(self):
@@ -83,18 +84,26 @@ class StatusBot(discord.Client):
     @tasks.loop(seconds=UPDATE_INTERVAL)
     async def status_update(self):
         try:
-            new_value = await self.update_func()
+            title, value = await self.update_func()
             
-            if new_value != self.last_value:
-                self.last_value = new_value
+            if title != self.last_title or value != self.last_value:
+                self.last_title = title
+                self.last_value = value
+                
+                # Update bot's nickname with the title
                 for guild in self.guilds:
                     try:
-                        await guild.me.edit(nick=new_value)
-                        logger.info(f"{self.network} {self.bot_type} Bot: Updated nickname to: {new_value} in {guild.name}")
+                        await guild.me.edit(nick=title)
                     except discord.errors.Forbidden:
                         logger.error(f"{self.network} {self.bot_type} Bot: Missing permissions in {guild.name}")
                     except Exception as e:
                         logger.error(f"{self.network} {self.bot_type} Bot: Error in {guild.name}: {str(e)}")
+                
+                # Update bot's activity with the value
+                activity = discord.Game(name=value)
+                await self.change_presence(activity=activity)
+                
+                logger.info(f"{self.network} {self.bot_type} Bot: Updated status - Title: {title}, Value: {value}")
         except Exception as e:
             logger.error(f"{self.network} {self.bot_type} Bot: Update error: {str(e)}")
 
@@ -113,10 +122,10 @@ async def get_game_number(contract, network):
         game_number = await run_in_executor(
             contract.functions.currentGameNumber().call
         )
-        return f"[{network} Game #]\n[{game_number}]"
+        return f"{network} Game", f"#{game_number}"  # Returns tuple of (title, value)
     except Exception as e:
         logger.error(f"Error getting {network} game number: {str(e)}")
-        return f"[{network} Game #]\n[Error]"
+        return f"{network} Game", "Error"
 
 async def get_prize_pool(contract, w3, network):
     """Query current prize pool from smart contract"""
@@ -127,11 +136,15 @@ async def get_prize_pool(contract, w3, network):
         prize_pool_wei = await run_in_executor(
             contract.functions.gamePrizePool(current_game).call
         )
-        prize_pool_eth = w3.from_wei(prize_pool_wei, 'ether')
-        return f"[{network} Prize Pool]\n[{prize_pool_eth:.2f} ETH]"
+        prize_pool_amount = w3.from_wei(prize_pool_wei, 'ether')
+        
+        # Use appropriate currency symbol based on network
+        currency = "WLD" if network.upper() == "WORLD" else "ETH"
+        
+        return f"{network} Prize", f"{prize_pool_amount:.2f} {currency}"  # Returns tuple of (title, value)
     except Exception as e:
         logger.error(f"Error getting {network} prize pool: {str(e)}")
-        return f"[{network} Prize Pool]\n[Error]"
+        return f"{network} Prize", "Error"
 
 async def main():
     try:

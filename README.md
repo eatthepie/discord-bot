@@ -55,3 +55,8 @@ sudo ./bot/setup-bot.sh
 ### Restart services
 
 sudo systemctl restart eth-monitor discord-bot
+
+For status bot, in Discord's Bot settings (Developer Portal):
+
+Change Nickname - to change its own nickname
+Presence Intent - to update its activity/presence status
